@@ -1,0 +1,784 @@
+// ================= BLYNK CONFIG =================
+#define BLYNK_TEMPLATE_ID "ํYOUR_BLYNK_TEMPLATE_ID_HERE"
+#define BLYNK_TEMPLATE_NAME "YOUR_BLYNK_TEMPLATE_NAME_HERE"
+#define WIFI_SSID "YOUR_WIFI_SSID_HERE"
+#define WIFI_PASS "YOUR_WIFI_PASS_HERE"
+#define BLYNK_AUTH_TOKEN "YOUR_BLYNK_AUTH_HERE"
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFiS3.h>
+#include <BlynkSimpleWifi.h>
+#include <math.h>
+
+// ================= LCD =================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ================= RELAY =================
+#define RELAY_PIN 7
+
+// ================= BLYNK PINS =================
+#define PIN_PM25            V0
+#define PIN_FANSTATUS       V1
+#define PIN_FANCONTROL      V2   // Manual Mode only
+#define PIN_MODE_SELECT     V3   // 0=AUTO, 1=MANUAL, 2=CUSTOM
+#define PIN_AQI             V4
+#define PIN_PM25_CHART      V5
+#define PIN_PM25_HISTORY    V6
+#define PIN_CUSTOM_MIN      V7   // Custom Threshold Mode only
+#define PIN_ALERT_LIMIT     V8
+#define PIN_FILTER_HEALTH   V9
+#define PIN_RESET_FILTER    V10
+#define PIN_AIR_STATUS      V11
+#define PIN_SYSTEM_STATUS   V12
+#define PIN_SENSOR_STATUS   V13
+#define PIN_EFFICIENCY      V14  // % reduction from session start
+#define PIN_TIME_TO_SAFE    V15  // minutes (actual or ETA)
+#define PIN_REMOVAL_RATE    V16  // ug/m3/min
+#define PIN_SAFE_TARGET     V17  // safe PM target
+#define PIN_CLEANING_STATUS V18  // string
+#define PIN_ENERGY_USED     V19  // Wh used in stats window
+#define PIN_ENERGY_SAVED    V20  // % saved vs always-on baseline
+#define PIN_FAN_POWER_W     V21  // fan power in watts
+#define PIN_ROOM_VOLUME     V22  // room volume in m3
+#define PIN_CADR_ESTIMATE   V23  // estimated CADR in m3/h
+#define PIN_RESET_STATS     V24  // reset performance + energy stats
+#define PIN_PM25_PRED_5M    V25  // predicted PM2.5 in 5 min
+#define PIN_PRED_TREND      V26  // RISING / FALLING / STABLE
+#define PIN_PRED_STATUS     V27  // short-term risk status
+
+// ================= PMS =================
+uint8_t buffer[32];
+
+// ================= TIMERS =================
+BlynkTimer timer;
+const unsigned long LCD_UPDATE_INTERVAL = 1000UL;
+const unsigned long HISTORY_INTERVAL    = 60000UL;
+const unsigned long SENSOR_TIMEOUT_MS   = 5000UL;
+
+// ================= FILTER / RUNTIME =================
+unsigned long fanOnStart = 0;
+unsigned long totalFanOnTime = 0;
+bool filterAlertSent = false;
+const unsigned long FILTER_LIFE_MS = 100UL * 60UL * 60UL * 1000UL; // 100 hours
+
+// ================= MOVING AVERAGE =================
+#define N_AVG 5
+int pmBuf[N_AVG] = {0};
+int pmIdx = 0;
+bool pmBufInit = false;
+
+// ================= SYSTEM =================
+const int PM_ON  = 20;
+const int PM_OFF = 18;
+const int ALERT_RESET_MARGIN = 2;
+const int CUSTOM_HYS = 2;
+
+enum OperatingMode {
+  MODE_AUTO = 0,
+  MODE_MANUAL = 1,
+  MODE_CUSTOM = 2
+};
+
+OperatingMode currentMode = MODE_AUTO;
+int fanState = 0;
+int manualFanCommand = 0;
+
+int pm25Value = 0;
+int pm25Avg = 0;
+int aqiValue = 0;
+int customMinPM = 25;
+
+int alertPM = 20;
+bool alertSent = false;
+
+// ================= SENSOR / STATUS =================
+unsigned long lastValidPmMs = 0;
+bool hasPmData = false;
+
+// ================= PERFORMANCE =================
+int safePmTarget = 25;        // ug/m3
+float fanPowerW = 2.16f;      // 12V x 0.18A = 2.16W (default)
+float roomVolumeM3 = 30.0f;   // default room volume
+
+bool sessionActive = false;
+bool safeReached = false;
+int sessionStartPM = 0;
+unsigned long sessionStartMs = 0;
+unsigned long safeReachedMs = 0;
+
+int reductionEfficiency = 0;  // %
+float removalRate = 0.0f;     // ug/m3/min
+int timeToSafeAirMin = -1;    // min (actual or ETA)
+float estimatedCADR = 0.0f;   // m3/h
+
+// ================= ENERGY STATS WINDOW =================
+unsigned long statsStartMs = 0;
+unsigned long statsStartFanRuntimeMs = 0;
+bool statsWindowReady = false;
+
+float energyUsedWh = 0.0f;
+float energySavedPercent = 0.0f;
+
+// ================= SHORT-TERM PREDICTION =================
+const unsigned long PREDICTION_INTERVAL_MS = 15000UL; // every 15 sec
+const int PRED_HISTORY_POINTS = 20;                   // 20 x 15 sec = 5 min history
+const int PREDICTION_HORIZON_MIN = 5;                // predict next 5 min
+
+float predPmBuf[PRED_HISTORY_POINTS] = {0};
+unsigned long predTimeBuf[PRED_HISTORY_POINTS] = {0};
+int predWriteIdx = 0;
+int predStored = 0;
+
+float predictedPM5Min = 0.0f;
+float predictedSlopePerMin = 0.0f;
+bool predictionReady = false;
+
+// ================= HELPERS =================
+int addAndGetAvg(int v) {
+  pmBuf[pmIdx] = v;
+  pmIdx = (pmIdx + 1) % N_AVG;
+
+  static int filled = 0;
+  if (!pmBufInit) {
+    filled++;
+    if (filled >= N_AVG) pmBufInit = true;
+  }
+
+  long sum = 0;
+  int count = pmBufInit ? N_AVG : pmIdx;
+  for (int i = 0; i < count; i++) sum += pmBuf[i];
+  return count ? sum / count : v;
+}
+
+int pm25_to_aqi(int pm) {
+  struct BP { int pml, pmh, aqil, aqih; };
+  BP t[] = {
+    {0,12,0,50}, {12,35,51,100}, {35,55,101,150},
+    {55,150,151,200}, {150,250,201,300},
+    {250,350,301,400}, {350,500,401,500}
+  };
+
+  for (int i = 0; i < 7; i++) {
+    if (pm >= t[i].pml && pm <= t[i].pmh) {
+      return (t[i].aqih - t[i].aqil) * (pm - t[i].pml) /
+             (t[i].pmh - t[i].pml) + t[i].aqil;
+    }
+  }
+  return 500;
+}
+
+const char* getAirStatusFromAQI(int aqi) {
+  if (aqi <= 50)  return "Good";
+  if (aqi <= 100) return "Moderate";
+  if (aqi <= 150) return "Sensitive Risk";
+  if (aqi <= 200) return "Unhealthy";
+  return "Very Unhealthy";
+}
+
+const char* getModeName() {
+  switch (currentMode) {
+    case MODE_AUTO:   return "AUTO";
+    case MODE_MANUAL: return "MANUAL";
+    case MODE_CUSTOM: return "CUSTOM";
+    default:          return "UNKNOWN";
+  }
+}
+
+const char* getSensorStatus() {
+  if (!hasPmData) return "WAITING";
+  if (millis() - lastValidPmMs > SENSOR_TIMEOUT_MS) return "TIMEOUT";
+  return "OK";
+}
+
+const char* getSystemStatus() {
+  if (!hasPmData) return "Waiting Sensor";
+  if (millis() - lastValidPmMs > SENSOR_TIMEOUT_MS) return "Sensor Timeout";
+
+  switch (currentMode) {
+    case MODE_AUTO:
+      return fanState ? "AUTO / FAN ON" : "AUTO / STANDBY";
+    case MODE_MANUAL:
+      return fanState ? "MANUAL / FAN ON" : "MANUAL / FAN OFF";
+    case MODE_CUSTOM:
+      return fanState ? "CUSTOM / FAN ON" : "CUSTOM / STANDBY";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+const char* getCleaningStatus() {
+  if (!hasPmData) return "WAITING SENSOR";
+  if (millis() - lastValidPmMs > SENSOR_TIMEOUT_MS) return "NO SENSOR";
+  if (pm25Avg <= safePmTarget) return "SAFE";
+  if (fanState == 1) {
+    if (safeReached) return "SAFE REACHED";
+    if (timeToSafeAirMin >= 0) return "CLEANING / ETA";
+    return "CLEANING";
+  }
+  return "IDLE";
+}
+
+unsigned int calculateChecksum(const uint8_t *data, int lenWithoutChecksum) {
+  unsigned int sum = 0;
+  for (int i = 0; i < lenWithoutChecksum; i++) sum += data[i];
+  return sum;
+}
+
+bool readPMS(int &pm25) {
+  while (Serial1.available() >= 32) {
+    if (Serial1.peek() != 0x42) {
+      Serial1.read();
+      continue;
+    }
+
+    if (Serial1.readBytes(buffer, 32) != 32) {
+      return false;
+    }
+
+    if (buffer[0] != 0x42 || buffer[1] != 0x4D) {
+      continue;
+    }
+
+    unsigned int receivedChecksum = (buffer[30] << 8) | buffer[31];
+    unsigned int calculatedChecksum = calculateChecksum(buffer, 30);
+    if (receivedChecksum != calculatedChecksum) {
+      Serial.println("PMS checksum error");
+      continue;
+    }
+
+    pm25 = (buffer[12] << 8) | buffer[13];
+    return true;
+  }
+  return false;
+}
+
+unsigned long getCurrentFanRuntime() {
+  if (fanState == 1 && fanOnStart > 0) {
+    return totalFanOnTime + (millis() - fanOnStart);
+  }
+  return totalFanOnTime;
+}
+
+int getFilterHealthPercent() {
+  unsigned long runtime = getCurrentFanRuntime();
+  if (runtime >= FILTER_LIFE_MS) return 0;
+  long percent = 100L - ((long)runtime * 100L / (long)FILTER_LIFE_MS);
+  return constrain((int)percent, 0, 100);
+}
+
+void updateFanRuntime() {
+  if (fanState == 1) {
+    if (fanOnStart == 0) fanOnStart = millis();
+  } else {
+    if (fanOnStart > 0) {
+      totalFanOnTime += millis() - fanOnStart;
+      fanOnStart = 0;
+    }
+  }
+}
+
+void updateAlertLogic() {
+  if (pm25Avg > alertPM && !alertSent) {
+    Blynk.logEvent("pm_alert", "PM2.5 = " + String(pm25Avg));
+    alertSent = true;
+  }
+  if (pm25Avg < (alertPM - ALERT_RESET_MARGIN)) {
+    alertSent = false;
+  }
+}
+
+void updateFilterAlert() {
+  if (getCurrentFanRuntime() >= FILTER_LIFE_MS && !filterAlertSent) {
+    Blynk.logEvent("filter_change", "ถึงเวลาเปลี่ยนไส้กรองอากาศ");
+    Serial.println("FILTER CHANGE ALERT");
+    filterAlertSent = true;
+  }
+}
+
+void resetPerformanceSession() {
+  sessionActive = false;
+  safeReached = false;
+  sessionStartPM = 0;
+  sessionStartMs = 0;
+  safeReachedMs = 0;
+  reductionEfficiency = 0;
+  removalRate = 0.0f;
+  timeToSafeAirMin = -1;
+  estimatedCADR = 0.0f;
+}
+
+void startStatsWindow() {
+  statsStartMs = millis();
+  statsStartFanRuntimeMs = getCurrentFanRuntime();
+  statsWindowReady = true;
+}
+
+void resetStatsWindow() {
+  resetPerformanceSession();
+  energyUsedWh = 0.0f;
+  energySavedPercent = 0.0f;
+  if (hasPmData) startStatsWindow();
+  else statsWindowReady = false;
+}
+
+void beginPerformanceSession() {
+  sessionActive = true;
+  safeReached = false;
+  sessionStartPM = max(pm25Avg, safePmTarget + 1);
+  sessionStartMs = millis();
+  safeReachedMs = 0;
+  reductionEfficiency = 0;
+  removalRate = 0.0f;
+  timeToSafeAirMin = -1;
+  estimatedCADR = 0.0f;
+
+  Serial.println("=== CLEANING SESSION START ===");
+  Serial.print("Start PM2.5 = ");
+  Serial.println(sessionStartPM);
+}
+
+void updateFanLogic() {
+  switch (currentMode) {
+    case MODE_AUTO:
+      if (pm25Avg > PM_ON) fanState = 1;
+      else if (pm25Avg < PM_OFF) fanState = 0;
+      break;
+
+    case MODE_MANUAL:
+      fanState = manualFanCommand ? 1 : 0;
+      break;
+
+    case MODE_CUSTOM: {
+      int customOn  = constrain(customMinPM, 1, 300);
+      int customOff = max(0, customOn - CUSTOM_HYS);
+      if (pm25Avg > customOn) fanState = 1;
+      else if (pm25Avg < customOff) fanState = 0;
+      break;
+    }
+  }
+
+  digitalWrite(RELAY_PIN, fanState ? HIGH : LOW);
+}
+
+void updatePerformanceMetrics() {
+  if (!hasPmData) return;
+  if (millis() - lastValidPmMs > SENSOR_TIMEOUT_MS) return;
+
+  if (!statsWindowReady) startStatsWindow();
+
+  // start a new cleaning session when the fan is on and PM is above safe target
+  if (!sessionActive && fanState == 1 && pm25Avg > safePmTarget) {
+    beginPerformanceSession();
+  }
+
+  if (sessionActive) {
+    long reduced = (long)sessionStartPM - (long)pm25Avg;
+    if (reduced < 0) reduced = 0;
+
+    if (sessionStartPM > 0) {
+      reductionEfficiency = constrain((int)(reduced * 100L / sessionStartPM), 0, 100);
+    } else {
+      reductionEfficiency = 0;
+    }
+
+    float elapsedMin = (millis() - sessionStartMs) / 60000.0f;
+    float elapsedHr  = (millis() - sessionStartMs) / 3600000.0f;
+
+    if (elapsedMin > 0.01f) {
+      removalRate = reduced / elapsedMin;
+      if (removalRate < 0) removalRate = 0;
+    } else {
+      removalRate = 0.0f;
+    }
+
+    // estimated CADR (well-mixed room approximation)
+    if (elapsedHr > 0.001f && sessionStartPM > 0 && pm25Avg > 0 && pm25Avg < sessionStartPM) {
+      float ratio = (float)sessionStartPM / (float)pm25Avg;
+      if (ratio > 1.0f) {
+        estimatedCADR = roomVolumeM3 * log(ratio) / elapsedHr;
+        if (!isfinite(estimatedCADR) || estimatedCADR < 0) estimatedCADR = 0.0f;
+      } else {
+        estimatedCADR = 0.0f;
+      }
+    } else {
+      estimatedCADR = 0.0f;
+    }
+
+    // actual safe time
+    if (!safeReached && pm25Avg <= safePmTarget) {
+      safeReached = true;
+      safeReachedMs = millis();
+      timeToSafeAirMin = (int)((safeReachedMs - sessionStartMs) / 60000UL);
+
+      Serial.println("=== SAFE AIR REACHED ===");
+      Serial.print("Time to Safe Air (min) = ");
+      Serial.println(timeToSafeAirMin);
+      Blynk.logEvent("safe_air", "ถึงระดับอากาศปลอดภัยแล้ว");
+    }
+
+    // ETA to safe if not reached yet
+    if (!safeReached) {
+      if (removalRate > 0.05f && pm25Avg > safePmTarget) {
+        float remain = (pm25Avg - safePmTarget) / removalRate;
+        if (remain < 0) remain = 0;
+        timeToSafeAirMin = (int)(remain + 0.999f);
+      } else {
+        timeToSafeAirMin = -1;
+      }
+    }
+
+    // close the session when fan stops; keep last values for display
+    if (fanState == 0) {
+      sessionActive = false;
+    }
+  }
+
+  // energy stats versus always-on baseline in the current stats window
+  if (statsWindowReady) {
+    unsigned long elapsedMs = millis() - statsStartMs;
+    unsigned long fanRuntimeMsInWindow = getCurrentFanRuntime() - statsStartFanRuntimeMs;
+
+    float elapsedHr = elapsedMs / 3600000.0f;
+    float actualFanHr = fanRuntimeMsInWindow / 3600000.0f;
+
+    energyUsedWh = fanPowerW * actualFanHr;
+    float baselineWh = fanPowerW * elapsedHr;
+    float savedWh = baselineWh - energyUsedWh;
+
+    if (baselineWh > 0.001f) {
+      energySavedPercent = constrain((int)((savedWh * 100.0f) / baselineWh), 0, 100);
+    } else {
+      energySavedPercent = 0.0f;
+    }
+  }
+}
+
+void addPredictionPoint(float pm) {
+  predPmBuf[predWriteIdx] = pm;
+  predTimeBuf[predWriteIdx] = millis();
+  predWriteIdx = (predWriteIdx + 1) % PRED_HISTORY_POINTS;
+  if (predStored < PRED_HISTORY_POINTS) predStored++;
+}
+
+bool computeShortTermPrediction() {
+  if (predStored < 5) {
+    predictionReady = false;
+    predictedPM5Min = 0.0f;
+    predictedSlopePerMin = 0.0f;
+    return false;
+  }
+
+  int newestIdx = (predWriteIdx - 1 + PRED_HISTORY_POINTS) % PRED_HISTORY_POINTS;
+  int oldestIdx = (predWriteIdx - predStored + PRED_HISTORY_POINTS) % PRED_HISTORY_POINTS;
+
+  float latestPm = predPmBuf[newestIdx];
+  float oldestPm = predPmBuf[oldestIdx];
+  float deltaMin = (predTimeBuf[newestIdx] - predTimeBuf[oldestIdx]) / 60000.0f;
+
+  if (deltaMin < 1.0f) {
+    predictionReady = false;
+    predictedPM5Min = 0.0f;
+    predictedSlopePerMin = 0.0f;
+    return false;
+  }
+
+  predictedSlopePerMin = (latestPm - oldestPm) / deltaMin;
+  predictedPM5Min = latestPm + (predictedSlopePerMin * PREDICTION_HORIZON_MIN);
+  if (predictedPM5Min < 0.0f) predictedPM5Min = 0.0f;
+
+  predictionReady = true;
+  return true;
+}
+
+void updatePredictionModel() {
+  if (!hasPmData) {
+    predictionReady = false;
+    return;
+  }
+
+  if (millis() - lastValidPmMs > SENSOR_TIMEOUT_MS) {
+    predictionReady = false;
+    return;
+  }
+
+  addPredictionPoint((float)pm25Avg);
+  computeShortTermPrediction();
+}
+
+const char* getPredictionTrend() {
+  if (!predictionReady) return "NO DATA";
+  if (predictedSlopePerMin > 1.0f) return "RISING";
+  if (predictedSlopePerMin < -1.0f) return "FALLING";
+  return "STABLE";
+}
+
+const char* getPredictionStatus() {
+  if (!predictionReady) return "INSUFFICIENT DATA";
+  if (predictedPM5Min > alertPM) return "HIGH RISK";
+  if (predictedPM5Min > safePmTarget) return "RISK IN 5 MIN";
+  if (predictedSlopePerMin < -0.5f) return "IMPROVING";
+  return "LIKELY SAFE";
+}
+
+void updateLCD() {
+  static unsigned long lastLcdMs = 0;
+  if (millis() - lastLcdMs < LCD_UPDATE_INTERVAL) return;
+  lastLcdMs = millis();
+
+  if (!hasPmData) {
+    lcd.setCursor(0, 0);
+    lcd.print("Reading sensor  ");
+    lcd.setCursor(0, 1);
+    lcd.print("Please wait...  ");
+    return;
+  }
+
+  if (millis() - lastValidPmMs > SENSOR_TIMEOUT_MS) {
+    lcd.setCursor(0, 0);
+    lcd.print("Sensor Timeout  ");
+    lcd.setCursor(0, 1);
+    lcd.print("Check PMS5003   ");
+    return;
+  }
+
+  char line1[17];
+  char line2[17];
+  snprintf(line1, sizeof(line1), "PM:%3d AQI:%3d", pm25Avg, aqiValue);
+  snprintf(line2, sizeof(line2), "%s F:%s %3d%%",
+           getModeName(),
+           fanState ? "ON" : "OFF",
+           getFilterHealthPercent());
+
+  lcd.setCursor(0, 0);
+  lcd.print("                ");
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+
+  lcd.setCursor(0, 1);
+  lcd.print("                ");
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
+}
+
+void sendBlynkLiveData() {
+  if (!hasPmData) {
+    Blynk.virtualWrite(PIN_PM25, 0);
+    Blynk.virtualWrite(PIN_AQI, 0);
+    Blynk.virtualWrite(PIN_FANSTATUS, fanState);
+    Blynk.virtualWrite(PIN_PM25_CHART, 0);
+    Blynk.virtualWrite(PIN_FILTER_HEALTH, getFilterHealthPercent());
+    Blynk.virtualWrite(PIN_AIR_STATUS, "WAITING");
+    Blynk.virtualWrite(PIN_SYSTEM_STATUS, "Waiting Sensor");
+    Blynk.virtualWrite(PIN_SENSOR_STATUS, "WAITING");
+
+    Blynk.virtualWrite(PIN_EFFICIENCY, 0);
+    Blynk.virtualWrite(PIN_TIME_TO_SAFE, 0);
+    Blynk.virtualWrite(PIN_REMOVAL_RATE, 0);
+    Blynk.virtualWrite(PIN_SAFE_TARGET, safePmTarget);
+    Blynk.virtualWrite(PIN_CLEANING_STATUS, "WAITING SENSOR");
+    Blynk.virtualWrite(PIN_ENERGY_USED, 0);
+    Blynk.virtualWrite(PIN_ENERGY_SAVED, 0);
+    Blynk.virtualWrite(PIN_FAN_POWER_W, fanPowerW);
+    Blynk.virtualWrite(PIN_ROOM_VOLUME, roomVolumeM3);
+    Blynk.virtualWrite(PIN_CADR_ESTIMATE, 0);
+    Blynk.virtualWrite(PIN_PM25_PRED_5M, 0);
+    Blynk.virtualWrite(PIN_PRED_TREND, "NO DATA");
+    Blynk.virtualWrite(PIN_PRED_STATUS, "INSUFFICIENT DATA");
+    return;
+  }
+
+  bool sensorTimeout = (millis() - lastValidPmMs > SENSOR_TIMEOUT_MS);
+
+  if (sensorTimeout) {
+    Blynk.virtualWrite(PIN_PM25, 0);
+    Blynk.virtualWrite(PIN_AQI, 0);
+    Blynk.virtualWrite(PIN_FANSTATUS, fanState);
+    Blynk.virtualWrite(PIN_PM25_CHART, 0);
+    Blynk.virtualWrite(PIN_FILTER_HEALTH, getFilterHealthPercent());
+    Blynk.virtualWrite(PIN_AIR_STATUS, "NO DATA");
+    Blynk.virtualWrite(PIN_SYSTEM_STATUS, "Sensor Timeout");
+    Blynk.virtualWrite(PIN_SENSOR_STATUS, "TIMEOUT");
+
+    Blynk.virtualWrite(PIN_EFFICIENCY, reductionEfficiency);
+    Blynk.virtualWrite(PIN_TIME_TO_SAFE, (timeToSafeAirMin >= 0) ? timeToSafeAirMin : 0);
+    Blynk.virtualWrite(PIN_REMOVAL_RATE, removalRate);
+    Blynk.virtualWrite(PIN_SAFE_TARGET, safePmTarget);
+    Blynk.virtualWrite(PIN_CLEANING_STATUS, "NO SENSOR");
+    Blynk.virtualWrite(PIN_ENERGY_USED, energyUsedWh);
+    Blynk.virtualWrite(PIN_ENERGY_SAVED, energySavedPercent);
+    Blynk.virtualWrite(PIN_FAN_POWER_W, fanPowerW);
+    Blynk.virtualWrite(PIN_ROOM_VOLUME, roomVolumeM3);
+    Blynk.virtualWrite(PIN_CADR_ESTIMATE, estimatedCADR);
+    Blynk.virtualWrite(PIN_PM25_PRED_5M, predictionReady ? predictedPM5Min : 0);
+    Blynk.virtualWrite(PIN_PRED_TREND, getPredictionTrend());
+    Blynk.virtualWrite(PIN_PRED_STATUS, getPredictionStatus());
+    return;
+  }
+
+  Blynk.virtualWrite(PIN_PM25, pm25Avg);
+  Blynk.virtualWrite(PIN_AQI, aqiValue);
+  Blynk.virtualWrite(PIN_FANSTATUS, fanState);
+  Blynk.virtualWrite(PIN_PM25_CHART, pm25Avg);
+  Blynk.virtualWrite(PIN_FILTER_HEALTH, getFilterHealthPercent());
+  Blynk.virtualWrite(PIN_AIR_STATUS, getAirStatusFromAQI(aqiValue));
+  Blynk.virtualWrite(PIN_SYSTEM_STATUS, getSystemStatus());
+  Blynk.virtualWrite(PIN_SENSOR_STATUS, getSensorStatus());
+
+  Blynk.virtualWrite(PIN_EFFICIENCY, reductionEfficiency);
+  Blynk.virtualWrite(PIN_TIME_TO_SAFE, (timeToSafeAirMin >= 0) ? timeToSafeAirMin : 0);
+  Blynk.virtualWrite(PIN_REMOVAL_RATE, removalRate);
+  Blynk.virtualWrite(PIN_SAFE_TARGET, safePmTarget);
+  Blynk.virtualWrite(PIN_CLEANING_STATUS, getCleaningStatus());
+  Blynk.virtualWrite(PIN_ENERGY_USED, energyUsedWh);
+  Blynk.virtualWrite(PIN_ENERGY_SAVED, energySavedPercent);
+  Blynk.virtualWrite(PIN_FAN_POWER_W, fanPowerW);
+  Blynk.virtualWrite(PIN_ROOM_VOLUME, roomVolumeM3);
+  Blynk.virtualWrite(PIN_CADR_ESTIMATE, estimatedCADR);
+  Blynk.virtualWrite(PIN_PM25_PRED_5M, predictionReady ? predictedPM5Min : 0);
+  Blynk.virtualWrite(PIN_PRED_TREND, getPredictionTrend());
+  Blynk.virtualWrite(PIN_PRED_STATUS, getPredictionStatus());
+}
+
+void sendBlynkHistory() {
+  Blynk.virtualWrite(PIN_PM25_HISTORY, pm25Avg);
+}
+
+void processPmData() {
+  int pmRaw;
+  if (!readPMS(pmRaw)) return;
+
+  pm25Value = pmRaw;
+  pm25Avg = addAndGetAvg(pmRaw);
+  aqiValue = pm25_to_aqi(pm25Avg);
+  lastValidPmMs = millis();
+  hasPmData = true;
+
+  updateAlertLogic();
+  updateFanLogic();
+  updatePerformanceMetrics();
+}
+
+// ================= BLYNK =================
+BLYNK_WRITE(PIN_MODE_SELECT) {
+  int modeValue = constrain(param.asInt(), 0, 2);
+  currentMode = (OperatingMode)modeValue;
+}
+
+BLYNK_WRITE(PIN_FANCONTROL) {
+  manualFanCommand = param.asInt() ? 1 : 0;
+
+  if (currentMode == MODE_MANUAL) {
+    fanState = manualFanCommand;
+    digitalWrite(RELAY_PIN, fanState ? HIGH : LOW);
+
+    if (fanState == 1 && hasPmData && pm25Avg > safePmTarget && !sessionActive) {
+      beginPerformanceSession();
+    }
+  }
+}
+
+BLYNK_WRITE(PIN_CUSTOM_MIN) {
+  customMinPM = constrain(param.asInt(), 1, 300);
+}
+
+BLYNK_WRITE(PIN_ALERT_LIMIT) {
+  alertPM = constrain(param.asInt(), 5, 300);
+  alertSent = false;
+}
+
+BLYNK_WRITE(PIN_SAFE_TARGET) {
+  safePmTarget = constrain(param.asInt(), 5, 100);
+}
+
+BLYNK_WRITE(PIN_FAN_POWER_W) {
+  float v = param.asFloat();
+  if (v < 0.1f) v = 0.1f;
+  if (v > 50.0f) v = 50.0f;
+  fanPowerW = v;
+}
+
+BLYNK_WRITE(PIN_ROOM_VOLUME) {
+  float v = param.asFloat();
+  if (v < 5.0f) v = 5.0f;
+  if (v > 200.0f) v = 200.0f;
+  roomVolumeM3 = v;
+}
+
+BLYNK_WRITE(PIN_RESET_FILTER) {
+  if (param.asInt()) {
+    totalFanOnTime = 0;
+    filterAlertSent = false;
+    fanOnStart = (fanState == 1) ? millis() : 0;
+    Serial.println("Filter timer reset");
+  }
+}
+
+BLYNK_WRITE(PIN_RESET_STATS) {
+  if (param.asInt()) {
+    resetStatsWindow();
+    Serial.println("Performance/Energy stats reset");
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Smart Aero");
+  lcd.setCursor(0, 1);
+  lcd.print("PM2.5 Monitor");
+  delay(1500);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+  lcd.setCursor(0, 1);
+  lcd.print("Please wait...");
+
+  Serial1.begin(9600);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Ready");
+  delay(1000);
+  lcd.clear();
+
+  resetPerformanceSession();
+
+  timer.setInterval(1000L, sendBlynkLiveData);
+  timer.setInterval(HISTORY_INTERVAL, sendBlynkHistory);
+  timer.setInterval(PREDICTION_INTERVAL_MS, updatePredictionModel);
+
+  Blynk.syncVirtual(
+    PIN_MODE_SELECT,
+    PIN_FANCONTROL,
+    PIN_CUSTOM_MIN,
+    PIN_ALERT_LIMIT,
+    PIN_SAFE_TARGET,
+    PIN_FAN_POWER_W,
+    PIN_ROOM_VOLUME
+  );
+}
+
+// ================= LOOP =================
+void loop() {
+  Blynk.run();
+  timer.run();
+
+  processPmData();
+  updateFanRuntime();
+  updateFilterAlert();
+  updateLCD();
+}
